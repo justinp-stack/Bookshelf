@@ -1,0 +1,382 @@
+{
+  "info": {
+    "name": "Bookshelf API",
+    "description": "Requests for the Bookshelf Go API (main.go).\n\n## Auth\nEvery route except `POST /token`, `POST /users` and `POST /login` requires an `Authorization: Bearer <jwt>` header.\n\nThis collection sets that up for you:\n- The **collection** Authorization tab is `Bearer Token` with value `{{token}}`. Every request inherits it.\n- `Auth / Get Token` and `Auth / Login` save the returned JWT into the `token` collection variable automatically.\n- A collection pre-request script also fetches a token from `/token` if `token` is empty, so you can just open any request and hit Send.\n\nTokens are HS256, signed with the hard-coded secret in main.go, and expire after 24 hours. Clear the `token` variable to force a fresh one.\n\n## Variables\n`baseUrl` defaults to `http://localhost:8080`. `authorId`, `genreId`, `publisherId` and `bookId` are filled in by the create requests so the get/update/borrow requests work in sequence.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{token}}", "type": "string" }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "if (pm.collectionVariables.get('token')) return;",
+          "pm.sendRequest({",
+          "  url: pm.collectionVariables.get('baseUrl') + '/token',",
+          "  method: 'POST',",
+          "  header: { 'Content-Type': 'application/json' },",
+          "  body: { mode: 'raw', raw: JSON.stringify({ client_name: 'postman' }) }",
+          "}, (err, res) => {",
+          "  if (!err && res.code === 200) pm.collectionVariables.set('token', res.json().token);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "token", "value": "" },
+    { "key": "authorId", "value": "" },
+    { "key": "genreId", "value": "" },
+    { "key": "publisherId", "value": "" },
+    { "key": "bookId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "description": "Public routes. These do not need a token.",
+      "item": [
+        {
+          "name": "Get Token (client)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set('token', pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"client_name\": \"postman\"\n}" },
+            "url": { "raw": "{{baseUrl}}/token", "host": ["{{baseUrl}}"], "path": ["token"] },
+            "description": "Issues a 24h JWT for any client name, no credentials needed. Saves it to `{{token}}`."
+          }
+        },
+        {
+          "name": "Register User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('201 Created', () => pm.response.to.have.status(201));"]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Jane Reader\",\n  \"email\": \"jane@example.com\"\n}" },
+            "url": { "raw": "{{baseUrl}}/users", "host": ["{{baseUrl}}"], "path": ["users"] },
+            "description": "Requires a `users` table, which main.go does not create. Returns 500 until it exists."
+          }
+        },
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code === 200) pm.collectionVariables.set('token', pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"jane@example.com\",\n  \"password\": \"anything\"\n}" },
+            "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] },
+            "description": "Looks up the user by email and returns a JWT. The password is not checked. Saves the token to `{{token}}`."
+          }
+        },
+        {
+          "name": "Example: no token (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/books", "host": ["{{baseUrl}}"], "path": ["books"] },
+            "description": "Same as `GET /books` but with auth turned off, to show what a protected route returns without a token."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Authors",
+      "item": [
+        {
+          "name": "Create Author",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('authorId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Terry Pratchett\"\n}" },
+            "url": { "raw": "{{baseUrl}}/authors", "host": ["{{baseUrl}}"], "path": ["authors"] }
+          }
+        },
+        {
+          "name": "List Authors",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/authors", "host": ["{{baseUrl}}"], "path": ["authors"] }
+          }
+        },
+        {
+          "name": "Get Author",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/authors/{{authorId}}", "host": ["{{baseUrl}}"], "path": ["authors", "{{authorId}}"] }
+          }
+        },
+        {
+          "name": "Update Author",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Sir Terry Pratchett\"\n}" },
+            "url": { "raw": "{{baseUrl}}/authors/{{authorId}}", "host": ["{{baseUrl}}"], "path": ["authors", "{{authorId}}"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Genres",
+      "item": [
+        {
+          "name": "Create Genre",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('genreId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Fantasy\"\n}" },
+            "url": { "raw": "{{baseUrl}}/genres", "host": ["{{baseUrl}}"], "path": ["genres"] }
+          }
+        },
+        {
+          "name": "List Genres",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/genres", "host": ["{{baseUrl}}"], "path": ["genres"] }
+          }
+        },
+        {
+          "name": "Get Genre",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/genres/{{genreId}}", "host": ["{{baseUrl}}"], "path": ["genres", "{{genreId}}"] }
+          }
+        },
+        {
+          "name": "Update Genre",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Comic Fantasy\"\n}" },
+            "url": { "raw": "{{baseUrl}}/genres/{{genreId}}", "host": ["{{baseUrl}}"], "path": ["genres", "{{genreId}}"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Publishers",
+      "item": [
+        {
+          "name": "Create Publisher",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('publisherId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Gollancz\"\n}" },
+            "url": { "raw": "{{baseUrl}}/publishers", "host": ["{{baseUrl}}"], "path": ["publishers"] }
+          }
+        },
+        {
+          "name": "List Publishers",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/publishers", "host": ["{{baseUrl}}"], "path": ["publishers"] }
+          }
+        },
+        {
+          "name": "Get Publisher",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/publishers/{{publisherId}}", "host": ["{{baseUrl}}"], "path": ["publishers", "{{publisherId}}"] }
+          }
+        },
+        {
+          "name": "Update Publisher",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Gollancz (Orion)\"\n}" },
+            "url": { "raw": "{{baseUrl}}/publishers/{{publisherId}}", "host": ["{{baseUrl}}"], "path": ["publishers", "{{publisherId}}"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Books",
+      "item": [
+        {
+          "name": "Create Book (existing IDs)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('bookId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Guards! Guards!\",\n  \"pages\": 416,\n  \"AuthorID\": \"{{authorId}}\",\n  \"GenreID\": \"{{genreId}}\",\n  \"PublisherID\": \"{{publisherId}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/books", "host": ["{{baseUrl}}"], "path": ["books"] },
+            "description": "`title` and `pages` (>= 1) are required. For author, genre and publisher send either the ID (`AuthorID`, `GenreID`, `PublisherID`, as strings) or a name (see next request). Note the ID keys are PascalCase."
+          }
+        },
+        {
+          "name": "Create Book (by names)",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('201 Created', () => pm.response.to.have.status(201));"] } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"The Hobbit\",\n  \"pages\": 310,\n  \"author\": \"J.R.R. Tolkien\",\n  \"genre\": \"High Fantasy\",\n  \"publisher\": \"Allen & Unwin\"\n}" },
+            "url": { "raw": "{{baseUrl}}/books", "host": ["{{baseUrl}}"], "path": ["books"] },
+            "description": "When names are sent instead of IDs, a new author/genre/publisher row is always inserted (no de-duplication)."
+          }
+        },
+        {
+          "name": "List Books",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/books", "host": ["{{baseUrl}}"], "path": ["books"] }
+          }
+        },
+        {
+          "name": "Get Book",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/books/{{bookId}}", "host": ["{{baseUrl}}"], "path": ["books", "{{bookId}}"] }
+          }
+        },
+        {
+          "name": "Update Book",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Guards! Guards! (Discworld #8)\",\n  \"pages\": \"420\"\n}" },
+            "url": { "raw": "{{baseUrl}}/books/{{bookId}}", "host": ["{{baseUrl}}"], "path": ["books", "{{bookId}}"] },
+            "description": "Partial update. Every value must be a JSON string, including `pages` (`\"420\"`, not `420`), otherwise the API returns 400 Invalid JSON."
+          }
+        },
+        {
+          "name": "Borrow Book",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/books/{{bookId}}/borrow", "host": ["{{baseUrl}}"], "path": ["books", "{{bookId}}", "borrow"] },
+            "description": "Returns 409 if the book is already checked out."
+          }
+        },
+        {
+          "name": "Return Book",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/books/{{bookId}}/return", "host": ["{{baseUrl}}"], "path": ["books", "{{bookId}}", "return"] },
+            "description": "Returns 400 if the book is not currently checked out."
+          }
+        }
+      ]
+    }
+  ]
+}

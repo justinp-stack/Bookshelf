@@ -14,8 +14,15 @@ import (
 )
 
 var db *sql.DB
+
+// TODO: Don't hard-code the secret. Anyone who reads this file can make their own
+// valid tokens. Load it from an environment variable instead: os.Getenv("JWT_SECRET").
 var jwtSecret = []byte("super-secret-key-change-in-production")
 
+// TODO: Use this for errors too, e.g. sendJSON(w, 404, map[string]string{"error": "Not found"}).
+// http.Error always sends Content-Type text/plain, even when the message looks like JSON.
+// Also stop sending err.Error() back to the caller, because it leaks database details.
+// Log it with log.Println and send a generic message instead.
 func sendJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -26,9 +33,11 @@ func sendJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 type Book struct {
-	ID          string  `json:"id"`
-	Title       *string `json:"title,omitempty"`
-	Pages       *int    `json:"pages,omitempty"`
+	ID    string  `json:"id"`
+	Title *string `json:"title,omitempty"`
+	Pages *int    `json:"pages,omitempty"`
+	// TODO: These three keys are PascalCase but every other key is lowercase.
+	// Rename them to publisher_id, genre_id and author_id, and update the Postman collection to match.
 	PublisherID *string `json:"PublisherID,omitempty"`
 	GenreID     *string `json:"GenreID,omitempty"`
 	AuthorID    *string `json:"AuthorID,omitempty"`
@@ -104,6 +113,8 @@ func getBook(w http.ResponseWriter, r *http.Request) {
 func borrowBook(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	// TODO: Check that the book exists first, and return 404 if it doesn't.
+	// Right now POST /books/999/borrow says "successfully borrowed" even if there is no book 999.
 	var currentlyTaken bool
 	err := db.QueryRow("SELECT status FROM status WHERE book_id = $1 ORDER BY taken DESC LIMIT 1", id).Scan(&currentlyTaken)
 
@@ -164,6 +175,7 @@ func returnBook(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// TODO: No route points to this function, so it's never used. Delete it, or add a route for it in main().
 func createFullBook(w http.ResponseWriter, r *http.Request) {
 	var b Book
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
@@ -195,6 +207,9 @@ func updateBook(w http.ResponseWriter, r *http.Request) {
 	}
 	b.ID = id
 
+	// TODO: Because this is map[string]string, every value must be sent as text.
+	// {"pages": 420} fails with "Invalid JSON" and only {"pages": "420"} works.
+	// Decode into a struct with pointer fields instead, like createBook does.
 	var updates map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
@@ -285,6 +300,8 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// TODO: These three blocks always insert a new row, so sending "author": "Tolkien" twice
+	// gives two separate Tolkien authors. Look the name up first and reuse it if it exists.
 	if !hasAuthorID && hasAuthorName {
 		var newAuthorID string
 		err := db.QueryRow("INSERT INTO authors (name) VALUES ($1) RETURNING id", *b.Author).Scan(&newAuthorID)
@@ -412,6 +429,7 @@ func getGenres(w http.ResponseWriter, r *http.Request) {
 	list := []Genre{}
 	for rows.Next() {
 		var g Genre
+		// TODO: The error from Scan is ignored here. Check it the same way getAuthors does.
 		rows.Scan(&g.ID, &g.Name)
 		list = append(list, g)
 	}
@@ -554,6 +572,7 @@ func updateAuthor(w http.ResponseWriter, r *http.Request) {
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// TODO: Add DELETE here if you add any delete routes.
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -597,6 +616,9 @@ func JWTAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// TODO: This gives a valid token to anyone who asks, with no password or key, so the
+// login protection on the other routes doesn't really protect anything.
+// Remove this route, or make it require a client secret.
 func generateClientToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ClientName string `json:"client_name"`
@@ -623,6 +645,8 @@ func generateClientToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// TODO: Users can't set a password. Add a password field, hash it with
+// golang.org/x/crypto/bcrypt, and save the hash in a password_hash column.
 func createUser(w http.ResponseWriter, r *http.Request) {
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
@@ -635,6 +659,8 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := db.QueryRow("INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id", u.Name, u.Email).Scan(&u.ID)
+	// TODO: Once email is UNIQUE, registering the same email twice ends up here as a 500.
+	// Return 409 Conflict with a clear message instead.
 	if err != nil {
 		log.Println("Error inserting user:", err)
 		http.Error(w, `{"error": "Failed to create user"}`, http.StatusInternalServerError)
@@ -658,6 +684,8 @@ func loginUser(w http.ResponseWriter, r *http.Request) {
 	var id int
 	var name string
 
+	// TODO: The password is never checked, so anyone who knows an email can log in as that user.
+	// Also select password_hash here and compare it with bcrypt.CompareHashAndPassword.
 	err := db.QueryRow("SELECT id, name FROM users WHERE email = $1", creds.Email).Scan(&id, &name)
 
 	if err == sql.ErrNoRows {
@@ -694,11 +722,18 @@ func loginUser(w http.ResponseWriter, r *http.Request) {
 
 func initDB() {
 	var err error
+	// TODO: The database password is written into the code and is already in the git history.
+	// Read the connection string from an environment variable instead:
+	// os.Getenv("DATABASE_URL"). Then change the Postgres password, because the old one is exposed.
 	db, err = sql.Open("postgres", "postgresql://postgres:Justineatsdicks123%40atime@localhost:5432/postgres?sslmode=disable")
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// TODO: There's no users table, so POST /users and POST /login always fail with a 500. Add:
+	//   CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT);
+	// TODO: pages, publisher_id, genre_id and author_id hold numbers but are stored as TEXT.
+	// Make them INTEGER, and make the *_id columns foreign keys to their tables.
 	schema := `
 	CREATE TABLE IF NOT EXISTS publishers (id SERIAL PRIMARY KEY, name TEXT);
 	CREATE TABLE IF NOT EXISTS genres (id SERIAL PRIMARY KEY, name TEXT);
