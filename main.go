@@ -3,35 +3,48 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
-	"strconv"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var db *sql.DB
-var jwtSecret = []byte("super-secret-key-change-in-production")
+var jwtSecret []byte
+
+func init() {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		log.Fatal("JWT_SECRET environment variable is required")
+	}
+	jwtSecret = []byte(secret)
+}
 
 func sendJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Println("JSON Encode Error:", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func sendError(w http.ResponseWriter, status int, message string) {
+	sendJSON(w, status, map[string]string{"error": message})
 }
 
 type Book struct {
 	ID          string  `json:"id"`
 	Title       *string `json:"title,omitempty"`
 	Pages       *int    `json:"pages,omitempty"`
-	PublisherID *string `json:"PublisherID,omitempty"`
-	GenreID     *string `json:"GenreID,omitempty"`
-	AuthorID    *string `json:"AuthorID,omitempty"`
+	PublisherID *int    `json:"publisher_id,omitempty"`
+	GenreID     *int    `json:"genre_id,omitempty"`
+	AuthorID    *int    `json:"author_id,omitempty"`
 	Genre       *string `json:"genre,omitempty"`
 	Publisher   *string `json:"publisher,omitempty"`
 	Author      *string `json:"author,omitempty"`
@@ -53,16 +66,17 @@ type Author struct {
 }
 
 type User struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password,omitempty"` // Used for incoming JSON only
 }
 
 func getBooks(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, title, CAST(pages AS INTEGER), publisher_id, genre_id, author_id FROM books")
+	rows, err := db.Query("SELECT id, title, pages, publisher_id, genre_id, author_id FROM books")
 	if err != nil {
 		log.Println("Database Error:", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	defer rows.Close()
@@ -72,14 +86,14 @@ func getBooks(w http.ResponseWriter, r *http.Request) {
 		var b Book
 		if err := rows.Scan(&b.ID, &b.Title, &b.Pages, &b.PublisherID, &b.GenreID, &b.AuthorID); err != nil {
 			log.Println("Scan Error:", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
 		list = append(list, b)
 	}
 	if err := rows.Err(); err != nil {
 		log.Println("Row Iteration Error:", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, list)
@@ -92,10 +106,11 @@ func getBook(w http.ResponseWriter, r *http.Request) {
 		Scan(&b.ID, &b.Title, &b.Pages, &b.PublisherID, &b.GenreID, &b.AuthorID)
 
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Book not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Book not found")
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, b)
@@ -104,16 +119,28 @@ func getBook(w http.ResponseWriter, r *http.Request) {
 func borrowBook(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	var existingBookID string
+	err := db.QueryRow("SELECT id FROM books WHERE id = $1", id).Scan(&existingBookID)
+	if err == sql.ErrNoRows {
+		sendError(w, http.StatusNotFound, "Book not found")
+		return
+	} else if err != nil {
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+
 	var currentlyTaken bool
-	err := db.QueryRow("SELECT status FROM status WHERE book_id = $1 ORDER BY taken DESC LIMIT 1", id).Scan(&currentlyTaken)
+	err = db.QueryRow("SELECT status FROM status WHERE book_id = $1 ORDER BY taken DESC LIMIT 1", id).Scan(&currentlyTaken)
 
 	if err != nil && err != sql.ErrNoRows {
-		http.Error(w, `{"error": "Database error checking status"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
 	if currentlyTaken {
-		http.Error(w, `{"error": "Book is already checked out"}`, http.StatusConflict)
+		sendError(w, http.StatusConflict, "Book is already checked out")
 		return
 	}
 
@@ -123,7 +150,8 @@ func borrowBook(w http.ResponseWriter, r *http.Request) {
 	`, id)
 
 	if err != nil {
-		http.Error(w, `{"error": "Failed to update status"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Failed to update status")
 		return
 	}
 
@@ -143,18 +171,20 @@ func returnBook(w http.ResponseWriter, r *http.Request) {
 	`, id)
 
 	if err != nil {
-		http.Error(w, `{"error": "Failed to update status"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Failed to update status")
 		return
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		http.Error(w, `{"error": "Error checking update result"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
 	if rowsAffected == 0 {
-		http.Error(w, `{"error": "Book is not currently checked out"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Book is not currently checked out")
 		return
 	}
 
@@ -167,14 +197,15 @@ func returnBook(w http.ResponseWriter, r *http.Request) {
 func createFullBook(w http.ResponseWriter, r *http.Request) {
 	var b Book
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	err := db.QueryRow("INSERT INTO books (title, pages, publisher_id, genre_id, author_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
 		b.Title, b.Pages, b.PublisherID, b.GenreID, b.AuthorID).Scan(&b.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
@@ -184,57 +215,67 @@ func createFullBook(w http.ResponseWriter, r *http.Request) {
 func updateBook(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var b Book
+
 	err := db.QueryRow("SELECT title, pages, publisher_id, genre_id, author_id FROM books WHERE id = $1", id).
 		Scan(&b.Title, &b.Pages, &b.PublisherID, &b.GenreID, &b.AuthorID)
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Book not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Book not found")
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	b.ID = id
 
-	var updates map[string]string
+	var updates struct {
+		Title       *string `json:"title"`
+		Pages       *int    `json:"pages"`
+		PublisherID *int    `json:"publisher_id"`
+		GenreID     *int    `json:"genre_id"`
+		AuthorID    *int    `json:"author_id"`
+	}
+
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
-	if title, ok := updates["title"]; ok {
-		b.Title = &title
+	if updates.Title != nil {
+		b.Title = updates.Title
 	}
-	if pages, ok := updates["pages"]; ok {
-		if n, err := strconv.Atoi(pages); err == nil {
-			b.Pages = &n
-		} else {
-			http.Error(w, `{"error": "Invalid pages"}`, http.StatusBadRequest)
+	if updates.Pages != nil {
+		if *updates.Pages < 1 {
+			sendError(w, http.StatusBadRequest, "Invalid pages")
 			return
 		}
+		b.Pages = updates.Pages
 	}
-	if pubID, ok := updates["PublisherID"]; ok {
-		b.PublisherID = &pubID
+	if updates.PublisherID != nil {
+		b.PublisherID = updates.PublisherID
 	}
-	if genID, ok := updates["GenreID"]; ok {
-		b.GenreID = &genID
+	if updates.GenreID != nil {
+		b.GenreID = updates.GenreID
 	}
-	if authID, ok := updates["AuthorID"]; ok {
-		b.AuthorID = &authID
+	if updates.AuthorID != nil {
+		b.AuthorID = updates.AuthorID
 	}
 
 	_, err = db.Exec("UPDATE books SET title=$1, pages=$2, publisher_id=$3, genre_id=$4, author_id=$5 WHERE id=$6",
 		b.Title, b.Pages, b.PublisherID, b.GenreID, b.AuthorID, b.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
+
 	sendJSON(w, http.StatusOK, b)
 }
 
 func createBook(w http.ResponseWriter, r *http.Request) {
 	var b Book
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	if b.Title != nil {
@@ -242,12 +283,12 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 		b.Title = &s
 	}
 	if b.Title == nil || *b.Title == "" {
-		http.Error(w, `{"error": "Title cannot be empty"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Title cannot be empty")
 		return
 	}
 
 	if b.Pages == nil || *b.Pages < 1 {
-		http.Error(w, `{"error": "Pages must be 1 or greater"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Pages must be 1 or greater")
 		return
 	}
 
@@ -264,61 +305,86 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 		b.Publisher = &s
 	}
 
-	hasAuthorID := b.AuthorID != nil && strings.TrimSpace(*b.AuthorID) != ""
+	hasAuthorID := b.AuthorID != nil
 	hasAuthorName := b.Author != nil && *b.Author != ""
 	if !hasAuthorID && !hasAuthorName {
-		http.Error(w, `{"error": "Valid Author ID or Name is required"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Valid Author ID or Name is required")
 		return
 	}
 
-	hasGenreID := b.GenreID != nil && strings.TrimSpace(*b.GenreID) != ""
+	hasGenreID := b.GenreID != nil
 	hasGenreName := b.Genre != nil && *b.Genre != ""
 	if !hasGenreID && !hasGenreName {
-		http.Error(w, `{"error": "Valid Genre ID or Name is required"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Valid Genre ID or Name is required")
 		return
 	}
 
-	hasPubID := b.PublisherID != nil && strings.TrimSpace(*b.PublisherID) != ""
+	hasPubID := b.PublisherID != nil
 	hasPubName := b.Publisher != nil && *b.Publisher != ""
 	if !hasPubID && !hasPubName {
-		http.Error(w, `{"error": "Valid Publisher ID or Name is required"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Valid Publisher ID or Name is required")
 		return
 	}
 
 	if !hasAuthorID && hasAuthorName {
-		var newAuthorID string
-		err := db.QueryRow("INSERT INTO authors (name) VALUES ($1) RETURNING id", *b.Author).Scan(&newAuthorID)
-		if err != nil {
-			http.Error(w, "Failed to create author: "+err.Error(), http.StatusInternalServerError)
+		var authorID int
+		err := db.QueryRow("SELECT id FROM authors WHERE name = $1", *b.Author).Scan(&authorID)
+		if err == sql.ErrNoRows {
+			err = db.QueryRow("INSERT INTO authors (name) VALUES ($1) RETURNING id", *b.Author).Scan(&authorID)
+			if err != nil {
+				log.Println("Database Error:", err)
+				sendError(w, http.StatusInternalServerError, "Failed to create author")
+				return
+			}
+		} else if err != nil {
+			log.Println("Database Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
-		b.AuthorID = &newAuthorID
+		b.AuthorID = &authorID
 	}
 
 	if !hasPubID && hasPubName {
-		var newPubID string
-		err := db.QueryRow("INSERT INTO publishers (name) VALUES ($1) RETURNING id", *b.Publisher).Scan(&newPubID)
-		if err != nil {
-			http.Error(w, "Failed to create publisher: "+err.Error(), http.StatusInternalServerError)
+		var pubID int
+		err := db.QueryRow("SELECT id FROM publishers WHERE name = $1", *b.Publisher).Scan(&pubID)
+		if err == sql.ErrNoRows {
+			err = db.QueryRow("INSERT INTO publishers (name) VALUES ($1) RETURNING id", *b.Publisher).Scan(&pubID)
+			if err != nil {
+				log.Println("Database Error:", err)
+				sendError(w, http.StatusInternalServerError, "Failed to create publisher")
+				return
+			}
+		} else if err != nil {
+			log.Println("Database Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
-		b.PublisherID = &newPubID
+		b.PublisherID = &pubID
 	}
 
 	if !hasGenreID && hasGenreName {
-		var newGenreID string
-		err := db.QueryRow("INSERT INTO genres (name) VALUES ($1) RETURNING id", *b.Genre).Scan(&newGenreID)
-		if err != nil {
-			http.Error(w, "Failed to create genre: "+err.Error(), http.StatusInternalServerError)
+		var genreID int
+		err := db.QueryRow("SELECT id FROM genres WHERE name = $1", *b.Genre).Scan(&genreID)
+		if err == sql.ErrNoRows {
+			err = db.QueryRow("INSERT INTO genres (name) VALUES ($1) RETURNING id", *b.Genre).Scan(&genreID)
+			if err != nil {
+				log.Println("Database Error:", err)
+				sendError(w, http.StatusInternalServerError, "Failed to create genre")
+				return
+			}
+		} else if err != nil {
+			log.Println("Database Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
-		b.GenreID = &newGenreID
+		b.GenreID = &genreID
 	}
 
 	err := db.QueryRow("INSERT INTO books (title, pages, publisher_id, genre_id, author_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
 		b.Title, b.Pages, b.PublisherID, b.GenreID, b.AuthorID).Scan(&b.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
@@ -328,7 +394,8 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 func getPublishers(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, name FROM publishers")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	defer rows.Close()
@@ -337,13 +404,15 @@ func getPublishers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var p Publisher
 		if err := rows.Scan(&p.ID, &p.Name); err != nil {
-			http.Error(w, `{"error": "Internal"}`, http.StatusInternalServerError)
+			log.Println("Database Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
 		list = append(list, p)
 	}
 	if err := rows.Err(); err != nil {
-		http.Error(w, `{"error": "Internal"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, list)
@@ -354,10 +423,11 @@ func getPublisher(w http.ResponseWriter, r *http.Request) {
 	var p Publisher
 	err := db.QueryRow("SELECT id, name FROM publishers WHERE id = $1", id).Scan(&p.ID, &p.Name)
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, p)
@@ -366,13 +436,14 @@ func getPublisher(w http.ResponseWriter, r *http.Request) {
 func createPublisher(w http.ResponseWriter, r *http.Request) {
 	var p Publisher
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	err := db.QueryRow("INSERT INTO publishers (name) VALUES ($1) RETURNING id", p.Name).Scan(&p.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusCreated, p)
@@ -382,13 +453,13 @@ func updatePublisher(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var p Publisher
 	if err := db.QueryRow("SELECT name FROM publishers WHERE id = $1", id).Scan(&p.Name); err != nil {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	}
 	p.ID = id
 	var updates map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	if name, ok := updates["name"]; ok {
@@ -396,7 +467,8 @@ func updatePublisher(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := db.Exec("UPDATE publishers SET name=$1 WHERE id=$2", p.Name, p.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, p)
@@ -405,18 +477,24 @@ func updatePublisher(w http.ResponseWriter, r *http.Request) {
 func getGenres(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, name FROM genres")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	defer rows.Close()
 	list := []Genre{}
 	for rows.Next() {
 		var g Genre
-		rows.Scan(&g.ID, &g.Name)
+		if err := rows.Scan(&g.ID, &g.Name); err != nil {
+			log.Println("Scan Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
+			return
+		}
 		list = append(list, g)
 	}
 	if err := rows.Err(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, list)
@@ -427,10 +505,11 @@ func getGenre(w http.ResponseWriter, r *http.Request) {
 	var g Genre
 	err := db.QueryRow("SELECT id, name FROM genres WHERE id = $1", id).Scan(&g.ID, &g.Name)
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, g)
@@ -439,13 +518,14 @@ func getGenre(w http.ResponseWriter, r *http.Request) {
 func createGenre(w http.ResponseWriter, r *http.Request) {
 	var g Genre
 	if err := json.NewDecoder(r.Body).Decode(&g); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	err := db.QueryRow("INSERT INTO genres (name) VALUES ($1) RETURNING id", g.Name).Scan(&g.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusCreated, g)
@@ -455,13 +535,13 @@ func updateGenre(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var g Genre
 	if err := db.QueryRow("SELECT name FROM genres WHERE id = $1", id).Scan(&g.Name); err != nil {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	}
 	g.ID = id
 	var updates map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	if name, ok := updates["name"]; ok {
@@ -469,7 +549,8 @@ func updateGenre(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := db.Exec("UPDATE genres SET name=$1 WHERE id=$2", g.Name, g.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, g)
@@ -478,7 +559,8 @@ func updateGenre(w http.ResponseWriter, r *http.Request) {
 func getAuthors(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, name FROM authors")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	defer rows.Close()
@@ -486,13 +568,15 @@ func getAuthors(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var a Author
 		if err := rows.Scan(&a.ID, &a.Name); err != nil {
-			http.Error(w, `{"error": "Internal"}`, http.StatusInternalServerError)
+			log.Println("Scan Error:", err)
+			sendError(w, http.StatusInternalServerError, "Internal Server Error")
 			return
 		}
 		list = append(list, a)
 	}
 	if err := rows.Err(); err != nil {
-		http.Error(w, `{"error": "Internal"}`, http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, list)
@@ -503,10 +587,11 @@ func getAuthor(w http.ResponseWriter, r *http.Request) {
 	var a Author
 	err := db.QueryRow("SELECT id, name FROM authors WHERE id = $1", id).Scan(&a.ID, &a.Name)
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, a)
@@ -515,13 +600,14 @@ func getAuthor(w http.ResponseWriter, r *http.Request) {
 func createAuthor(w http.ResponseWriter, r *http.Request) {
 	var a Author
 	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	err := db.QueryRow("INSERT INTO authors (name) VALUES ($1) RETURNING id", a.Name).Scan(&a.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusCreated, a)
@@ -531,13 +617,13 @@ func updateAuthor(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var a Author
 	if err := db.QueryRow("SELECT name FROM authors WHERE id = $1", id).Scan(&a.Name); err != nil {
-		http.Error(w, `{"error": "Not found"}`, http.StatusNotFound)
+		sendError(w, http.StatusNotFound, "Not found")
 		return
 	}
 	a.ID = id
 	var updates map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	if name, ok := updates["name"]; ok {
@@ -545,16 +631,45 @@ func updateAuthor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := db.Exec("UPDATE authors SET name=$1 WHERE id=$2", a.Name, a.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 	sendJSON(w, http.StatusOK, a)
 }
 
+func deleteBook(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	result, err := db.Exec("DELETE FROM books WHERE id = $1", id)
+	if err != nil {
+		log.Println("Database Delete Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Println("Database Error:", err)
+		sendError(w, http.StatusInternalServerError, "Error checking delete result")
+		return
+	}
+
+	if rowsAffected == 0 {
+		sendError(w, http.StatusNotFound, "Book not found")
+		return
+	}
+
+	sendJSON(w, http.StatusOK, map[string]string{
+		"message": "Book successfully deleted",
+		"id":      id,
+	})
+}
+
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
@@ -568,14 +683,15 @@ func enableCORS(next http.Handler) http.Handler {
 
 func JWTAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/users" || r.URL.Path == "/login" || r.URL.Path == "/token" {
+		path := r.URL.Path
+		if path == "/users" || path == "/login" || strings.HasPrefix(path, "/books") || strings.HasPrefix(path, "/genres") || strings.HasPrefix(path, "/publishers") || strings.HasPrefix(path, "/authors") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			http.Error(w, `{"error": "Missing or invalid Authorization header"}`, http.StatusUnauthorized)
+			sendError(w, http.StatusUnauthorized, "Missing or invalid Authorization header")
 			return
 		}
 
@@ -589,7 +705,7 @@ func JWTAuthMiddleware(next http.Handler) http.Handler {
 		})
 
 		if err != nil || !token.Valid {
-			http.Error(w, `{"error": "Invalid or expired token"}`, http.StatusUnauthorized)
+			sendError(w, http.StatusUnauthorized, "Invalid or expired token")
 			return
 		}
 
@@ -597,50 +713,37 @@ func JWTAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func generateClientToken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ClientName string `json:"client_name"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.ClientName) == "" {
-		req.ClientName = "guest"
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"client": req.ClientName,
-		"exp":    time.Now().Add(time.Hour * 24).Unix(),
-	})
-
-	tokenString, err := token.SignedString(jwtSecret)
-	if err != nil {
-		http.Error(w, `{"error": "Could not generate token"}`, http.StatusInternalServerError)
-		return
-	}
-
-	sendJSON(w, http.StatusOK, map[string]string{
-		"message": "Token generated successfully",
-		"token":   tokenString,
-	})
-}
-
 func createUser(w http.ResponseWriter, r *http.Request) {
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
-	if u.Name == "" || u.Email == "" {
-		http.Error(w, `{"error": "Name and Email are required"}`, http.StatusBadRequest)
+	if u.Name == "" || u.Email == "" || u.Password == "" {
+		sendError(w, http.StatusBadRequest, "Name, Email, and Password are required")
 		return
 	}
-	err := db.QueryRow("INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id", u.Name, u.Email).Scan(&u.ID)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
 	if err != nil {
-		log.Println("Error inserting user:", err)
-		http.Error(w, `{"error": "Failed to create user"}`, http.StatusInternalServerError)
+		log.Println("Bcrypt Error:", err)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
+	err = db.QueryRow("INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id", u.Name, u.Email, string(hash)).Scan(&u.ID)
+	if err != nil {
+		if strings.Contains(err.Error(), "unique constraint") {
+			sendError(w, http.StatusConflict, "Email already exists")
+			return
+		}
+		log.Println("Error inserting user:", err)
+		sendError(w, http.StatusInternalServerError, "Failed to create user")
+		return
+	}
+
+	u.Password = "" // Clear password before sending response
 	sendJSON(w, http.StatusCreated, u)
 }
 
@@ -651,21 +754,26 @@ func loginUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		sendError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	var id int
 	var name string
+	var hash string
 
-	err := db.QueryRow("SELECT id, name FROM users WHERE email = $1", creds.Email).Scan(&id, &name)
-
+	err := db.QueryRow("SELECT id, name, password_hash FROM users WHERE email = $1", creds.Email).Scan(&id, &name, &hash)
 	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Invalid email or password"}`, http.StatusUnauthorized)
+		sendError(w, http.StatusUnauthorized, "Invalid email or password")
 		return
 	} else if err != nil {
 		log.Println("Login error:", err)
-		http.Error(w, `{"error": "Internal Server Error"}`, http.StatusInternalServerError)
+		sendError(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(creds.Password)); err != nil {
+		sendError(w, http.StatusUnauthorized, "Invalid email or password")
 		return
 	}
 
@@ -677,7 +785,8 @@ func loginUser(w http.ResponseWriter, r *http.Request) {
 
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		http.Error(w, `{"error": "Could not generate token"}`, http.StatusInternalServerError)
+		log.Println("JWT Error:", err)
+		sendError(w, http.StatusInternalServerError, "Could not generate token")
 		return
 	}
 
@@ -694,22 +803,41 @@ func loginUser(w http.ResponseWriter, r *http.Request) {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("postgres", "postgresql://postgres:Justineatsdicks123%40atime@localhost:5432/postgres?sslmode=disable")
+
+	dbUser := os.Getenv("DBUSER")
+	if dbUser == "" {
+		log.Fatal("DBUSER environment variable is required")
+	}
+
+	dbPass := os.Getenv("DBPASS")
+	if dbPass == "" {
+		log.Fatal("DBPASS environment variable is required")
+	}
+
+	dsn := fmt.Sprintf("host=localhost port=5432 user=%s password=%s dbname=postgres sslmode=disable", dbUser, dbPass)
+
+	db, err = sql.Open("postgres", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	schema := `
-	CREATE TABLE IF NOT EXISTS publishers (id SERIAL PRIMARY KEY, name TEXT);
-	CREATE TABLE IF NOT EXISTS genres (id SERIAL PRIMARY KEY, name TEXT);
-	CREATE TABLE IF NOT EXISTS authors (id SERIAL PRIMARY KEY, name TEXT);
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY, 
+		name TEXT NOT NULL, 
+		email TEXT UNIQUE NOT NULL, 
+		password_hash TEXT
+	);
+	CREATE TABLE IF NOT EXISTS publishers (id SERIAL PRIMARY KEY, name TEXT UNIQUE);
+	CREATE TABLE IF NOT EXISTS genres (id SERIAL PRIMARY KEY, name TEXT UNIQUE);
+	CREATE TABLE IF NOT EXISTS authors (id SERIAL PRIMARY KEY, name TEXT UNIQUE);
 	CREATE TABLE IF NOT EXISTS books (
 		id SERIAL PRIMARY KEY, 
 		title TEXT, 
-		pages TEXT, 
-		publisher_id TEXT, 
-		genre_id TEXT, 
-		author_id TEXT
+		pages INTEGER, 
+		publisher_id INTEGER REFERENCES publishers(id), 
+		genre_id INTEGER REFERENCES genres(id), 
+		author_id INTEGER REFERENCES authors(id)
 	);
 	CREATE TABLE IF NOT EXISTS status (
 		id serial4 NOT NULL,
@@ -731,14 +859,15 @@ func main() {
 
 	http.HandleFunc("POST /users", createUser)
 	http.HandleFunc("POST /login", loginUser)
-	http.HandleFunc("POST /token", generateClientToken)
 
 	http.HandleFunc("GET /books", getBooks)
 	http.HandleFunc("GET /books/{id}", getBook)
 	http.HandleFunc("POST /books/{id}/borrow", borrowBook)
 	http.HandleFunc("POST /books/{id}/return", returnBook)
 	http.HandleFunc("POST /books", createBook)
+	http.HandleFunc("POST /books/full", createFullBook) // Kept and routed
 	http.HandleFunc("PATCH /books/{id}", updateBook)
+	http.HandleFunc("DELETE /books/{id}", deleteBook)
 
 	http.HandleFunc("GET /publishers", getPublishers)
 	http.HandleFunc("GET /publishers/{id}", getPublisher)
