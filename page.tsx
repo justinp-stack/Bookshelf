@@ -65,8 +65,30 @@ export default function Page() {
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    const initializeAuth = () => {
-      const storedToken = localStorage.getItem("my_app_jwt_token");
+    const initializeAuth = async () => {
+      let storedToken = localStorage.getItem("my_app_jwt_token");
+      if (!storedToken) {
+        try {
+          const res = await fetch("http://localhost:8080/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ client_name: "NextJS Web Client" })
+          });
+          
+          if (res.ok) {
+            const data = await res.json();
+            storedToken = data.token ?? null;
+            if (storedToken) {
+              localStorage.setItem("my_app_jwt_token", storedToken);
+            }
+          } else {
+            console.error("Backend rejected token generation");
+          }
+        } catch (err) {
+          console.error("Cannot reach the Go backend to get token", err);
+        }
+      }
+      
       if (storedToken) {
         setToken(storedToken);
       }
@@ -78,10 +100,7 @@ export default function Page() {
 
   const fetchData = async (currentToken: string) => {
     try {
-      const headers: Record<string, string> = {};
-      if (currentToken) {
-        headers['Authorization'] = `Bearer ${currentToken}`;
-      }
+      const headers = { 'Authorization': `Bearer ${currentToken}` };
 
       const [booksRes, pubRes, authRes, genRes] = await Promise.all([
         fetch('http://localhost:8080/books', { headers }),
@@ -114,7 +133,12 @@ export default function Page() {
   
   useEffect(() => {
     if (isAuthReady) {
-      fetchData(token);
+      if (token) {
+        fetchData(token);
+      } else {
+        setHasError(true);
+        setIsLoading(false);
+      }
     }
   }, [isAuthReady, token]);
 
